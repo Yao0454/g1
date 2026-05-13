@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# TensorRT 引擎（机器特定，clone 后自己 export）
+*.engine
+
+# 对话历史（隐私 / 调试数据）
+data/session/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
