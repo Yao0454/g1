@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
-# 一个入口跑 g1 项目里的四个 Python：
-#   ./run.sh              → 默认 follow（跟随 + 手势 一体）
-#   ./run.sh follow       → 同上
-#   ./run.sh vision       → 只跟随（人体跟随，原 ~/Vision/main.py）
-#   ./run.sh move         → 只手势（手腕→手臂动作，原 ~/Vision/movement.py）
-#   ./run.sh talk [args]  → 语音助手（args 透传给 talk.py，比如 --wake --g1）
-#   ./run.sh llm          → ollama 交互对话
-# 都在 vision conda env 跑，ROS Foxy 已 source；FastDDS 用本目录的 no-shm 配置。
+# g1 项目统一入口（vision conda env + ROS Foxy + FastDDS no-shm）。
+#
+# 默认：./run.sh   → 三件事一起跑（跟随 + 手势 + 语音）
+#
+#   ./run.sh g1     [args]    跟随 + 手势 + 语音 (推荐)
+#   ./run.sh talk   [args]    纯语音
+#   ./run.sh llm    [args]    纯 ollama REPL
+#
+# 任何参数都会透传给底下的 python 脚本，比如：
+#   ./run.sh g1 --no-voice          # 只视觉
+#   ./run.sh g1 --bridge-host 192.168.x.x
+#   ./run.sh talk --hear            # 纯听写
+#
+# C++ 端先单独跑：
+#   ~/unitree_sdk2/build/bin/g1_node eth0
 set -e
 
 source /opt/ros/foxy/setup.bash
@@ -16,13 +23,13 @@ conda activate vision
 cd "$(dirname "$0")"
 export FASTRTPS_DEFAULT_PROFILES_FILE="$(pwd)/fastdds_no_shm.xml"
 
-target="${1:-follow}"
+target="${1:-g1}"
 shift || true
 
 case "$target" in
-  follow|vision|move|talk|llm)
+  g1|talk|llm)
     exec python "${target}.py" "$@" ;;
   *)
-    echo "用法: $0 {follow|vision|move|talk|llm} [args...]" >&2
+    echo "用法: $0 {g1|talk|llm} [args...]" >&2
     exit 1 ;;
 esac
