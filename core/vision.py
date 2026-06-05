@@ -19,6 +19,7 @@ core/vision.py — 视觉模块：人体跟随 + 手势识别（一份 YOLO-pose
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -34,6 +35,9 @@ from .bridge import Bridge
 from .stream import MjpegStream
 
 # ── 关键点索引（COCO 17 点）─────────────────────────────────────────────────
+KP_NOSE = 0
+KP_L_EYE, KP_R_EYE = 1, 2
+KP_L_EAR, KP_R_EAR = 3, 4
 KP_L_SHOULDER, KP_R_SHOULDER = 5, 6
 KP_L_ELBOW, KP_R_ELBOW = 7, 8
 KP_L_WRIST, KP_R_WRIST = 9, 10
@@ -46,9 +50,10 @@ TARGET_DIST = 1.0  # m，跟随的目标距离
 OBSTACLE_DIST = 0.6  # m，中央深度小于这个就算被挡
 ROI_TOP, ROI_BOTTOM = 0.35, 0.75  # 障碍 ROI 在画面纵向的位置
 MIN_PERSON_AREA = 8000  # 像素²，真人 bbox 至少这么大（小于这个当机器人自己的手）
-KP_CONF, ARM_CONF = 0.5, 0.6
+KP_CONF, ARM_CONF = 0.5, 0.5  # 推理用关键点置信度阈值（握手姿势小臂常斜着，conf 拉太高会丢）
+KP_CONF_PERSON = 0.3  # "是真人"的判据宽容点，边缘肩膀 conf 容易低
 MAX_FOLLOW_DIST = 3.0  # m，超过这个距离的人不锁
-ARM_SEG_MIN_FRAC = 0.02  # 大/小臂在画面里最短要这个比例（≈20px @ 1080p）
+WRIST_FORWARD_M = 0.15  # 手腕比身体（bbox 深度）近相机 ≥ 此米数 → 伸手
 
 ARM_ACTIONS = {
     "left": (26, "挥手"),
@@ -116,8 +121,8 @@ class Vision:
     def _open_camera(self) -> None:
         self._pipeline = rs.pipeline()
         cfg = rs.config()
-        cfg.enable_stream(rs.stream.color, 1920, 1080, rs.format.bgr8, 30)
-        cfg.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
+        cfg.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+        cfg.enable_stream(rs.stream.depth, 848, 480, rs.format.z16, 30)
         self._pipeline.start(cfg)
         self._align = rs.align(rs.stream.color)
         print("[VISION] RealSense 已启动")
@@ -154,78 +159,92 @@ class Vision:
             return None
 
     @classmethod
-    def _has_kp(cls, keypoints, *idxs) -> bool:
+    def _has_kp(cls, keypoints, *idxs, min_conf=KP_CONF) -> bool:
         for idx in idxs:
-            if cls._kp(keypoints, idx) is not None:
+            if cls._kp(keypoints, idx, min_conf) is not None:
                 return True
         return False
 
     @classmethod
     def _is_real_person(cls, box, keypoints, frame_h: int) -> bool:
-        """真人 = bbox 够大 + 看得到肩 + 看得到髋。
-        机器人自己伸进 FOV 的手只能拍到前臂/手，既没肩也没髋。
-        坐着的人（腿被桌挡）仍有肩和髋 → 不会被误判。
+        """真人 = bbox 够大 + 看到任一肩/肘/髋/膝关键点（低 conf 也行）。
+        机器人自己伸进 FOV 的手只有腕，没肩没肘没髋没膝 → 仍过滤。
+        近距离贴脸/拿东西挡腰也能进入候选。
         """
         x1, y1, x2, y2 = (float(box.xyxy[0][i]) for i in range(4))
         if (x2 - x1) * (y2 - y1) < MIN_PERSON_AREA:
             return False
         if keypoints is None:
-            return True  # 没关键点信息就只信 bbox 大小
-        if not cls._has_kp(keypoints, KP_L_SHOULDER, KP_R_SHOULDER):
-            return False
-        if not cls._has_kp(keypoints, KP_L_HIP, KP_R_HIP):
-            return False
-        return True
-
-    @staticmethod
-    def _arm_extended(shoulder, elbow, wrist, frame_h: int) -> bool:
-        """伸手握手姿势：大臂自然垂下、小臂往外伸 ≈90°。
-
-        几何条件（图像坐标，y 向下增加）：
-          - 大臂朝下：肘 y > 肩 y，且 |elbow.x - shoulder.x| < (elbow.y - shoulder.y)
-          - 小臂偏水平：|wrist.x - elbow.x| > |wrist.y - elbow.y|
-          - 大/小臂都得有最小长度，过滤识别噪声
-        手自然下垂（大臂小臂都竖）→ 小臂条件不满足；高举过头（肘在肩上）→ 大臂条件不满足。
-        """
-        if shoulder is None or elbow is None or wrist is None:
-            return False
-        sx, sy, _ = shoulder
-        ex, ey, _ = elbow
-        wx, wy, _ = wrist
-        min_seg = max(15.0, frame_h * ARM_SEG_MIN_FRAC)
-
-        ua_dx = abs(ex - sx)
-        ua_dy = ey - sy
-        if ua_dy < min_seg or ua_dy < ua_dx:  # 大臂没朝下
-            return False
-
-        fa_dx = abs(wx - ex)
-        fa_dy = abs(wy - ey)
-        if fa_dx < min_seg * 1.5:  # 小臂没向外伸够长
-            return False
-        if fa_dy > fa_dx:  # 小臂还是竖的，不是水平
-            return False
-        return True
+            return True
+        return cls._has_kp(
+            keypoints,
+            KP_L_SHOULDER, KP_R_SHOULDER,
+            KP_L_ELBOW, KP_R_ELBOW,
+            KP_L_HIP, KP_R_HIP,
+            KP_L_KNEE, KP_R_KNEE,
+            min_conf=KP_CONF_PERSON,
+        )
 
     @classmethod
-    def _detect_gesture(cls, keypoints, frame_h: int) -> str | None:
-        ls = cls._kp(keypoints, KP_L_SHOULDER)
-        rs_ = cls._kp(keypoints, KP_R_SHOULDER)
-        le = cls._kp(keypoints, KP_L_ELBOW)
-        re = cls._kp(keypoints, KP_R_ELBOW)
+    def _is_facing_camera(cls, keypoints) -> bool:
+        """脸部关键点（鼻/眼）至少有一个 → 朝向相机。
+        背对时这些都看不到，YOLO 顶多估出两个耳朵；纯背影不做手势检测。
+        """
+        if keypoints is None:
+            return False
+        return cls._has_kp(keypoints, KP_NOSE, KP_L_EYE, KP_R_EYE,
+                           min_conf=KP_CONF_PERSON)
+
+    @staticmethod
+    def _sample_depth(depth_frame, x: float, y: float, w: int, h: int) -> float:
+        """3×3 邻域取最小有效深度（米），无效返回 0。比单像素 get_distance 稳。"""
+        xi, yi = int(x), int(y)
+        if xi < 1 or yi < 1 or xi >= w - 1 or yi >= h - 1:
+            return 0.0
+        best = 0.0
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                v = depth_frame.get_distance(xi + dx, yi + dy)
+                if v > 0.1 and (best == 0.0 or v < best):
+                    best = v
+        return best
+
+    @classmethod
+    def _wrist_state(cls, wrist, body_depth: float,
+                     depth_frame, w: int, h: int) -> tuple[bool, str]:
+        """纯深度判：手腕比身体近相机 ≥ WRIST_FORWARD_M → 伸手。
+        不需要大臂可见 —— 近距离 YOLO 经常拿不到肩部关键点。
+        """
+        if wrist is None:
+            return False, "no-W"
+        wx, wy, _ = wrist
+        d_w = cls._sample_depth(depth_frame, wx, wy, w, h)
+        if d_w <= 0:
+            return False, "no-d"
+        fwd = body_depth - d_w  # 正值 = 手腕比身体更近相机
+        if fwd < WRIST_FORWARD_M:
+            return False, f"{fwd:+.2f}m"
+        return True, f"OK {fwd:+.2f}m"
+
+    @classmethod
+    def _detect_gesture_full(cls, keypoints, frame_h: int, body_depth: float,
+                             depth_frame, w: int, h: int) -> tuple[str | None, str]:
+        """返回 (gesture, debug_label)。判据：左/右手腕是否明显比身体靠前。"""
         lw = cls._kp(keypoints, KP_L_WRIST, ARM_CONF)
         rw = cls._kp(keypoints, KP_R_WRIST, ARM_CONF)
 
-        left = cls._arm_extended(ls, le, lw, frame_h)
-        right = cls._arm_extended(rs_, re, rw, frame_h)
+        left_ok, l_lbl = cls._wrist_state(lw, body_depth, depth_frame, w, h)
+        right_ok, r_lbl = cls._wrist_state(rw, body_depth, depth_frame, w, h)
 
-        if left and right:
-            return "both"
-        if left:
-            return "left"
-        if right:
-            return "right"
-        return None
+        if left_ok and right_ok:
+            g = "both"
+        elif left_ok:
+            g = "left"
+        elif right_ok:
+            g = "right"
+        else:
+            g = None
+        return g, f"body:{body_depth:.2f}m | L:{l_lbl} | R:{r_lbl}"
 
     @staticmethod
     def _depth_median(depth_frame, box, w: int, h: int, sample_frac: float = 0.15):
@@ -379,13 +398,28 @@ class Vision:
                             1,
                         )
 
+                gesture_dbg = ""
                 if target is not None:
-                    d, cx, _, kpts = target
+                    d, cx, target_box, kpts = target
                     if self.gesture and kpts is not None:
-                        gesture = self._detect_gesture(kpts, h)
+                        gesture, gesture_dbg = self._detect_gesture_full(
+                            kpts, h, d, depth, w, h
+                        )
                     if self.follow:
                         follow_dist = d
                         follow_err = (cx - w / 2) / (w / 2)
+                    # 调试：每只胳膊状态画在 target 框上方
+                    tx1, ty1, _, _ = (int(v) for v in target_box.xyxy[0])
+                    if gesture_dbg:
+                        cv2.putText(
+                            annotated,
+                            gesture_dbg,
+                            (tx1, max(0, ty1 - 30)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (255, 200, 0),
+                            1,
+                        )
 
                 # 下发跟随
                 if self.follow and follow_dist is not None and follow_dist > 0.1:
