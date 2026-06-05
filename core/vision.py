@@ -115,7 +115,7 @@ class Vision:
         print(f"[VISION] 加载 {Path(path).name} …", flush=True)
         self._model = YOLO(path, task="pose")
         print("[VISION] 热身 …", flush=True)
-        self._model(np.zeros((1080, 1920, 3), dtype=np.uint8), verbose=False)
+        self._model(np.zeros((720, 1280, 3), dtype=np.uint8), verbose=False)
         print("[VISION] 模型就绪")
 
     def _open_camera(self) -> None:
