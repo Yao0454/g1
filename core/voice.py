@@ -20,6 +20,7 @@ core/voice.py — 语音模块：唤醒词 → VAD 录音 → ASR → Chat → �
     · 唤醒确认用本地 beep()（80ms 短"嘀"），不走 TTS，响完 mic.drain() 一次
     · TTS 走 G1 喇叭是异步的（UDP 发完就返回），按字数估个时长 sleep + drain，期间不收麦
 """
+
 from __future__ import annotations
 
 import shutil
@@ -46,7 +47,7 @@ DEFAULT_WAKE_WORDS = ["你好机器人", "你好宇树"]
 
 SAMPLE_RATE = 16000
 ASR_PROVIDER = "cuda"
-TTS_PROVIDER = "cpu"    # melo-tts onnx 在 CUDA EP 上长句会 Reshape 崩
+TTS_PROVIDER = "cpu"  # melo-tts onnx 在 CUDA EP 上长句会 Reshape 崩
 KWS_PROVIDER = "cpu"
 
 
@@ -55,21 +56,30 @@ def ensure_mic_default(verbose: bool = True) -> None:
     if not shutil.which("pactl"):
         return
     try:
-        cur = subprocess.run(["pactl", "get-default-source"],
-                             capture_output=True, text=True).stdout.strip()
+        cur = subprocess.run(
+            ["pactl", "get-default-source"], capture_output=True, text=True
+        ).stdout.strip()
         if not cur:
-            info = subprocess.run(["pactl", "info"], capture_output=True, text=True).stdout
+            info = subprocess.run(
+                ["pactl", "info"], capture_output=True, text=True
+            ).stdout
             for ln in info.splitlines():
                 if ln.startswith("Default Source:"):
                     cur = ln.split(":", 1)[1].strip()
-        srcs = subprocess.run(["pactl", "list", "short", "sources"],
-                              capture_output=True, text=True).stdout
+        srcs = subprocess.run(
+            ["pactl", "list", "short", "sources"], capture_output=True, text=True
+        ).stdout
         names = [ln.split("\t")[1] for ln in srcs.splitlines() if "\t" in ln]
-        real = [n for n in names if not n.endswith(".monitor") and "platform-sound" not in n]
+        real = [
+            n for n in names if not n.endswith(".monitor") and "platform-sound" not in n
+        ]
         usb = [n for n in real if "usb" in n.lower()] or real
         if not usb:
             if verbose:
-                print("[MIC] ⚠️  PulseAudio 没看到 USB 麦克风，确认插好了？", file=sys.stderr)
+                print(
+                    "[MIC] ⚠️  PulseAudio 没看到 USB 麦克风，确认插好了？",
+                    file=sys.stderr,
+                )
             return
         tgt = usb[0]
         if cur == tgt:
@@ -78,8 +88,9 @@ def ensure_mic_default(verbose: bool = True) -> None:
             return
         subprocess.run(["pactl", "set-default-source", tgt], check=False)
         out = tgt.replace("alsa_input.", "alsa_output.")
-        sinks = subprocess.run(["pactl", "list", "short", "sinks"],
-                               capture_output=True, text=True).stdout
+        sinks = subprocess.run(
+            ["pactl", "list", "short", "sinks"], capture_output=True, text=True
+        ).stdout
         sink_names = [ln.split("\t")[1] for ln in sinks.splitlines() if "\t" in ln]
         if out in sink_names:
             subprocess.run(["pactl", "set-default-sink", out], check=False)
@@ -94,13 +105,20 @@ def ensure_mic_default(verbose: bool = True) -> None:
 def _import_sd():
     try:
         import sounddevice as sd
+
         return sd
     except ImportError:
-        raise RuntimeError("缺 sounddevice：pip install sounddevice（系统装 libportaudio2）")
+        raise RuntimeError(
+            "缺 sounddevice：pip install sounddevice（系统装 libportaudio2）"
+        )
 
 
-def beep(freq: float = 880.0, dur: float = 0.12, vol: float = 0.25,
-         sample_rate: int = SAMPLE_RATE) -> None:
+def beep(
+    freq: float = 880.0,
+    dur: float = 0.12,
+    vol: float = 0.25,
+    sample_rate: int = SAMPLE_RATE,
+) -> None:
     """唤醒确认音，比 VAD min_speech 短，响完 drain 一下不会回灌。"""
     try:
         sd = _import_sd()
@@ -123,7 +141,9 @@ class MicStream:
         sd = _import_sd()
         self.sample_rate = sample_rate
         self.block = int(0.1 * sample_rate)
-        self._stream = sd.InputStream(channels=1, dtype="float32", samplerate=sample_rate)
+        self._stream = sd.InputStream(
+            channels=1, dtype="float32", samplerate=sample_rate
+        )
         self._stream.start()
         time.sleep(0.25)
         self.drain()
@@ -159,8 +179,14 @@ class _ASR:
         print(f"[ASR] 加载 SenseVoice ({provider}) …", flush=True)
         t0 = time.time()
         self.r = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=str(model), tokens=str(tokens), num_threads=2,
-            use_itn=True, language="zh", provider=provider, debug=False)
+            model=str(model),
+            tokens=str(tokens),
+            num_threads=2,
+            use_itn=True,
+            language="zh",
+            provider=provider,
+            debug=False,
+        )
         print(f"[ASR] 就绪 {time.time() - t0:.1f}s")
 
     def transcribe(self, samples: np.ndarray, sr: int = SAMPLE_RATE) -> str:
@@ -176,16 +202,25 @@ class _LocalTTS:
         model = model_dir / "model.onnx"
         if not model.exists():
             raise FileNotFoundError(f"找不到 TTS 模型 {model}")
-        rule_fsts = ",".join(str(model_dir / f) for f in ("date.fst", "number.fst", "phone.fst")
-                             if (model_dir / f).exists())
+        rule_fsts = ",".join(
+            str(model_dir / f)
+            for f in ("date.fst", "number.fst", "phone.fst")
+            if (model_dir / f).exists()
+        )
         cfg = sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
                 vits=sherpa_onnx.OfflineTtsVitsModelConfig(
                     model=str(model),
                     lexicon=str(model_dir / "lexicon.txt"),
-                    tokens=str(model_dir / "tokens.txt")),
-                provider=provider, num_threads=4, debug=False),
-            rule_fsts=rule_fsts, max_num_sentences=1)
+                    tokens=str(model_dir / "tokens.txt"),
+                ),
+                provider=provider,
+                num_threads=4,
+                debug=False,
+            ),
+            rule_fsts=rule_fsts,
+            max_num_sentences=1,
+        )
         if not cfg.validate():
             raise RuntimeError("本地 TTS 配置校验失败")
         print(f"[TTS] 加载 melo-tts ({provider}) …", flush=True)
@@ -205,11 +240,15 @@ class _LocalTTS:
 
 
 # ── 唤醒词 ──────────────────────────────────────────────────────────────────
-def _ensure_keywords_file(phrases, kws_dir: Path = KWS_DIR,
-                          out_path: Path = KEYWORDS_FILE) -> Path:
+def _ensure_keywords_file(
+    phrases, kws_dir: Path = KWS_DIR, out_path: Path = KEYWORDS_FILE
+) -> Path:
     from sherpa_onnx import text2token
+
     tokens_path = kws_dir / "tokens.txt"
-    encoded = text2token([[p] for p in phrases], tokens=str(tokens_path), tokens_type="ppinyin")
+    encoded = text2token(
+        [[p] for p in phrases], tokens=str(tokens_path), tokens_type="ppinyin"
+    )
     lines = [" ".join(tok) + f" @{p}" for p, tok in zip(phrases, encoded)]
     content = "\n".join(lines) + "\n"
     if not (out_path.exists() and out_path.read_text(encoding="utf-8") == content):
@@ -221,8 +260,14 @@ def _ensure_keywords_file(phrases, kws_dir: Path = KWS_DIR,
 
 
 class _Wake:
-    def __init__(self, phrases, kws_dir: Path = KWS_DIR,
-                 provider: str = KWS_PROVIDER, threshold: float = 0.25, score: float = 1.0):
+    def __init__(
+        self,
+        phrases,
+        kws_dir: Path = KWS_DIR,
+        provider: str = KWS_PROVIDER,
+        threshold: float = 0.25,
+        score: float = 1.0,
+    ):
         enc = next(kws_dir.glob("encoder-*chunk-16-left-64.onnx"))
         dec = next(kws_dir.glob("decoder-*chunk-16-left-64.onnx"))
         joi = next(kws_dir.glob("joiner-*chunk-16-left-64.onnx"))
@@ -230,12 +275,21 @@ class _Wake:
         print(f"[KWS] 加载 zipformer-kws ({provider}) …", flush=True)
         t0 = time.time()
         self.s = sherpa_onnx.KeywordSpotter(
-            tokens=str(kws_dir / "tokens.txt"), encoder=str(enc), decoder=str(dec), joiner=str(joi),
-            keywords_file=str(kw), num_threads=2,
-            keywords_threshold=threshold, keywords_score=score, provider=provider)
+            tokens=str(kws_dir / "tokens.txt"),
+            encoder=str(enc),
+            decoder=str(dec),
+            joiner=str(joi),
+            keywords_file=str(kw),
+            num_threads=2,
+            keywords_threshold=threshold,
+            keywords_score=score,
+            provider=provider,
+        )
         print(f"[KWS] 就绪 {time.time() - t0:.1f}s  唤醒词: {', '.join(phrases)}")
 
-    def wait(self, mic: MicStream, stop: threading.Event, debug: bool = False) -> str | None:
+    def wait(
+        self, mic: MicStream, stop: threading.Event, debug: bool = False
+    ) -> str | None:
         st = self.s.create_stream()
         last = time.time()
         peak = 0.0
@@ -268,9 +322,15 @@ def _make_vad(min_silence: float = 0.6):
     return sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=30)
 
 
-def _vad_capture(vad, mic: MicStream, stop: threading.Event, *,
-                 max_seconds: float = 12.0, start_timeout: float = 6.0,
-                 debug: bool = False) -> np.ndarray:
+def _vad_capture(
+    vad,
+    mic: MicStream,
+    stop: threading.Event,
+    *,
+    max_seconds: float = 12.0,
+    start_timeout: float = 6.0,
+    debug: bool = False,
+) -> np.ndarray:
     vad.reset()
     spoke = False
     t_start = time.time()
@@ -290,8 +350,10 @@ def _vad_capture(vad, mic: MicStream, stop: threading.Event, *,
         if not vad.empty():
             seg = np.asarray(vad.front.samples, dtype=np.float32)
             vad.pop()
-            print(f"[LISTEN] 录到 {len(seg) / mic.sample_rate:.1f}s "
-                  f"(peak {float(np.abs(seg).max()):.3f})")
+            print(
+                f"[LISTEN] 录到 {len(seg) / mic.sample_rate:.1f}s "
+                f"(peak {float(np.abs(seg).max()):.3f})"
+            )
             return seg
         now = time.time()
         if debug and now - last >= 2.0:
@@ -326,13 +388,17 @@ def _prep_for_asr(samples: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
 
 # ── Voice 主类 ──────────────────────────────────────────────────────────────
 class Voice:
-    def __init__(self, bridge: Bridge, *,
-                 chat=None,
-                 wake_words: list[str] | None = None,
-                 wake_threshold: float = 0.25,
-                 listen_seconds: float = 12.0,
-                 local_tts: bool = False,
-                 verbose: bool = False):
+    def __init__(
+        self,
+        bridge: Bridge,
+        *,
+        chat=None,
+        wake_words: list[str] | None = None,
+        wake_threshold: float = 0.25,
+        listen_seconds: float = 12.0,
+        local_tts: bool = False,
+        verbose: bool = False,
+    ):
         """
         bridge: 走 G1 喇叭的通道（bridge.send_tts(text)）
         chat:   有的话每次识别完会跑 chat.reply(text) → 把回复说出来；没有则只识别打印
@@ -433,8 +499,10 @@ class Voice:
                 if not self._vad.empty():
                     seg = np.asarray(self._vad.front.samples, dtype=np.float32)
                     self._vad.pop()
-                    print(f"[LISTEN] 录到 {len(seg) / self._mic.sample_rate:.1f}s "
-                          f"(peak {float(np.abs(seg).max()):.3f})")
+                    print(
+                        f"[LISTEN] 录到 {len(seg) / self._mic.sample_rate:.1f}s "
+                        f"(peak {float(np.abs(seg).max()):.3f})"
+                    )
                     if seg.size:
                         t0 = time.time()
                         text = self._asr.transcribe(_prep_for_asr(seg))
@@ -463,9 +531,13 @@ class Voice:
                 print(f"[KWS] 唤醒：{hit}")
                 beep()
                 self._mic.drain()
-                samples = _vad_capture(self._vad, self._mic, self._stop,
-                                       max_seconds=self.listen_seconds,
-                                       debug=self.verbose)
+                samples = _vad_capture(
+                    self._vad,
+                    self._mic,
+                    self._stop,
+                    max_seconds=self.listen_seconds,
+                    debug=self.verbose,
+                )
                 if samples.size == 0:
                     continue
                 t0 = time.time()

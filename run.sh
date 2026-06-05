@@ -3,9 +3,10 @@
 #
 # 默认：./run.sh   → 三件事一起跑（跟随 + 手势 + 语音）
 #
-#   ./run.sh g1     [args]    跟随 + 手势 + 语音 (推荐)
-#   ./run.sh talk   [args]    纯语音
-#   ./run.sh llm    [args]    纯 ollama REPL
+#   ./run.sh g1       [args]  跟随 + 手势 + 语音 (推荐)
+#   ./run.sh gesture  [args]  只跑手势识别（无跟随/无语音）
+#   ./run.sh talk     [args]  纯语音
+#   ./run.sh llm      [args]  纯 ollama REPL
 #
 # 任何参数都会透传给底下的 python 脚本，比如：
 #   ./run.sh g1 --no-voice          # 只视觉
@@ -27,9 +28,9 @@ target="${1:-g1}"
 shift || true
 
 case "$target" in
-  g1|talk|llm)
+  g1|gesture|talk|llm)
     exec python "${target}.py" "$@" ;;
   *)
-    echo "用法: $0 {g1|talk|llm} [args...]" >&2
+    echo "用法: $0 {g1|gesture|talk|llm} [args...]" >&2
     exit 1 ;;
 esac

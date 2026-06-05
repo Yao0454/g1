@@ -16,6 +16,7 @@ g1/
 │   ├── chat.py            ─ class Chat     ollama 对话 + 历史持久化
 │   └── stream.py          ─ class MjpegStream  共享 MJPEG 调试流
 ├── g1.py                 # ⭐ 主入口：三件事一起跑
+├── gesture.py            # 只跑手势识别（无跟随/无语音）
 ├── talk.py               # 纯语音工具（不带视觉/动作）
 ├── llm.py                # 纯 ollama REPL
 ├── run.sh                # 统一启动脚本
@@ -62,6 +63,7 @@ cd ~/g1
 ./run.sh g1 --no-voice            # 只视觉（跟随 + 手势）
 ./run.sh g1 --no-vision           # 只语音
 ./run.sh g1 --no-gesture          # 只跟随
+./run.sh gesture                  # 只手势识别（无跟随/无语音）
 ./run.sh talk --hear              # 纯听写调试（不唤醒/不对话）
 ./run.sh llm                      # ollama REPL
 ```

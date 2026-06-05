@@ -5,6 +5,7 @@ core/chat.py — ollama 对话封装。
     chat = Chat(session_id="g1", user_name="unitree")
     reply = chat.reply("你好")
 """
+
 from __future__ import annotations
 
 import json
@@ -21,12 +22,17 @@ import ollama  # noqa: E402
 class Chat:
     SYSTEM_PROMPT = "你是一个非常友善的宇树 G1 机器人，你的概括能力很强，你每次回答都是一句话，不超过20个字"
 
-    def __init__(self, session_id: str = "g1", user_name: str = "unitree",
-                 model: str = "qwen3:8b", data_dir: Path | None = None):
+    def __init__(
+        self,
+        session_id: str = "g1",
+        user_name: str = "unitree",
+        model: str = "qwen3:8b",
+        data_dir: Path | None = None,
+    ):
         self.session_id = session_id
         self.user_name = user_name
         self.model = model
-        self.data_dir = (data_dir or Path.cwd() / "data" / "session")
+        self.data_dir = data_dir or Path.cwd() / "data" / "session"
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.history: list[dict] = self._load()
 
@@ -48,8 +54,8 @@ class Chat:
     def _save(self) -> None:
         try:
             self._path().write_text(
-                json.dumps(self.history, ensure_ascii=False, indent=2),
-                encoding="utf-8")
+                json.dumps(self.history, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
         except Exception as e:
             print(f"[CHAT] 历史保存失败：{e}")
 

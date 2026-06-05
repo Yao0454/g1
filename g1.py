@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from pathlib import Path
 
 from core import Bridge, Chat, MjpegStream, Vision, Voice
 
@@ -41,6 +42,10 @@ def main() -> None:
     p.add_argument("--wake-threshold", type=float, default=0.25)
     p.add_argument("--listen-seconds", type=float, default=12.0)
     p.add_argument("--stream-port", type=int, default=6769, help="MJPEG 调试流端口（0 关）")
+    p.add_argument("--max-dist", type=float, default=3.0, help="只锁这个距离以内的人（m）")
+    p.add_argument("--log-frames", action="store_true",
+                   help="把每帧推理结果存到 data/snapshots/（事后排查识别问题）")
+    p.add_argument("--log-frames-every", type=float, default=2.0, help="快照间隔(s)")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
 
@@ -65,9 +70,16 @@ def main() -> None:
     # 视觉跑主线程（相机/YOLO 比较重，留主线程）
     if not args.no_vision:
         stream = MjpegStream(port=args.stream_port) if args.stream_port else None
+        snapshot_dir = (
+            Path(__file__).resolve().parent / "data" / "snapshots"
+            if args.log_frames else None
+        )
         vision = Vision(bridge, stream=stream,
                         follow=not args.no_follow,
                         gesture=not args.no_gesture,
+                        max_dist=args.max_dist,
+                        snapshot_dir=snapshot_dir,
+                        snapshot_every=args.log_frames_every,
                         verbose=args.verbose)
         try:
             vision.run()   # 阻塞，Ctrl-C 跳出

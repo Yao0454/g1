@@ -7,11 +7,20 @@
     from core.bridge import Bridge
     ...
 """
-from .bridge import Bridge, MSG_MOVE, MSG_ARM, MSG_TTS
+
+from .bridge import MSG_ARM, MSG_MOVE, MSG_TTS, Bridge
 from .chat import Chat
 from .stream import MjpegStream
 from .vision import Vision
 from .voice import Voice
 
-__all__ = ["Bridge", "Vision", "Voice", "Chat", "MjpegStream",
-           "MSG_MOVE", "MSG_ARM", "MSG_TTS"]
+__all__ = [
+    "Bridge",
+    "Vision",
+    "Voice",
+    "Chat",
+    "MjpegStream",
+    "MSG_MOVE",
+    "MSG_ARM",
+    "MSG_TTS",
+]

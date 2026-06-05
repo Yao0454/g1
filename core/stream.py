@@ -7,6 +7,7 @@ core/stream.py — 一个共享的 MJPEG HTTP 流，多个组件可往里塞最�
     stream.update(frame_bgr)        # 在主循环里随便塞
     # 浏览器打开 http://<ip>:6769/
 """
+
 from __future__ import annotations
 
 import threading
@@ -39,8 +40,9 @@ class MjpegStream:
                     self.send_error(404)
                     return
                 self.send_response(200)
-                self.send_header("Content-Type",
-                                 "multipart/x-mixed-replace; boundary=frame")
+                self.send_header(
+                    "Content-Type", "multipart/x-mixed-replace; boundary=frame"
+                )
                 self.end_headers()
                 try:
                     while True:
@@ -48,12 +50,16 @@ class MjpegStream:
                             f = owner._frame
                         if f is None:
                             continue
-                        ok, jpg = cv2.imencode(".jpg", f,
-                                               [cv2.IMWRITE_JPEG_QUALITY, owner.jpeg_quality])
+                        ok, jpg = cv2.imencode(
+                            ".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, owner.jpeg_quality]
+                        )
                         if not ok:
                             continue
-                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-                                         + jpg.tobytes() + b"\r\n")
+                        self.wfile.write(
+                            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                            + jpg.tobytes()
+                            + b"\r\n"
+                        )
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
