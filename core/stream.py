@@ -17,16 +17,20 @@ import cv2
 
 
 class MjpegStream:
-    def __init__(self, port: int = 6769, jpeg_quality: int = 80):
+    def __init__(self, port: int = 6769, jpeg_quality: int = 70):
         self.port = port
         self.jpeg_quality = jpeg_quality
         self._frame = None
-        self._lock = threading.Lock()
+        self._frame_id = 0
+        self._cond = threading.Condition()
         self._server: HTTPServer | None = None
 
     def update(self, frame) -> None:
-        with self._lock:
-            self._frame = None if frame is None else frame.copy()
+        # plot() 每帧给新 array，不必 copy；用 Condition 唤醒 HTTP 消费者
+        with self._cond:
+            self._frame = frame
+            self._frame_id += 1
+            self._cond.notify_all()
 
     def start(self) -> None:
         owner = self
@@ -45,9 +49,14 @@ class MjpegStream:
                 )
                 self.end_headers()
                 try:
+                    last_id = -1
                     while True:
-                        with owner._lock:
+                        with owner._cond:
+                            # 没新帧就阻塞，不烧 CPU
+                            while owner._frame_id == last_id:
+                                owner._cond.wait(timeout=1.0)
                             f = owner._frame
+                            last_id = owner._frame_id
                         if f is None:
                             continue
                         ok, jpg = cv2.imencode(

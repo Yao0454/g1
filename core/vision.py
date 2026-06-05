@@ -268,8 +268,9 @@ class Vision:
 
     @staticmethod
     def _check_obstacles(depth_frame, w: int, h: int):
-        depth = np.asanyarray(depth_frame.get_data()).astype(float) / 1000.0
-        roi = depth[int(h * ROI_TOP) : int(h * ROI_BOTTOM), :]
+        # 只把 ROI 这一条带从 uint16 转成 float32 / 1000，省一大半时间
+        full = np.asanyarray(depth_frame.get_data())  # uint16, full frame
+        roi = full[int(h * ROI_TOP) : int(h * ROI_BOTTOM), :].astype(np.float32) * 0.001
 
         def min_valid(z):
             v = z[(z > 0.1) & (z < 5.0)]
@@ -280,6 +281,7 @@ class Vision:
             min_valid(roi[:, w // 3 : 2 * w // 3]),
             min_valid(roi[:, 2 * w // 3 :]),
         )
+
 
     # ── 主循环 ──────────────────────────────────────────────────────────────
     def run(self) -> None:
@@ -303,7 +305,7 @@ class Vision:
 
                 # 推理：拉高 conf，过掉远处零散误检
                 pose_res = self._model(frame, conf=0.5, verbose=False)[0]
-                annotated = pose_res.plot(boxes=False)  # 自己画框，避免每个人都"亮起来"
+                annotated = pose_res.plot(boxes=False)  # 用 YOLO 画骨架，自己画框
 
                 gesture = None
                 follow_dist = None
