@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 import os
+import queue
 import threading
 import time
 from datetime import datetime
@@ -196,29 +197,27 @@ class Vision:
                            min_conf=KP_CONF_PERSON)
 
     @staticmethod
-    def _sample_depth(depth_frame, x: float, y: float, w: int, h: int) -> float:
-        """3×3 邻域取最小有效深度（米），无效返回 0。比单像素 get_distance 稳。"""
+    def _sample_depth(depth_arr, x: float, y: float, w: int, h: int) -> float:
+        """3×3 邻域取最小有效深度（米），无效返回 0。numpy 切片，比 get_distance 快得多。"""
         xi, yi = int(x), int(y)
         if xi < 1 or yi < 1 or xi >= w - 1 or yi >= h - 1:
             return 0.0
-        best = 0.0
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                v = depth_frame.get_distance(xi + dx, yi + dy)
-                if v > 0.1 and (best == 0.0 or v < best):
-                    best = v
-        return best
+        patch = depth_arr[yi - 1 : yi + 2, xi - 1 : xi + 2]
+        valid = patch[patch > 100]  # uint16 mm, > 0.1m
+        if valid.size == 0:
+            return 0.0
+        return float(valid.min()) * 0.001
 
     @classmethod
     def _wrist_state(cls, wrist, body_depth: float,
-                     depth_frame, w: int, h: int) -> tuple[bool, str]:
+                     depth_arr, w: int, h: int) -> tuple[bool, str]:
         """纯深度判：手腕比身体近相机 ≥ WRIST_FORWARD_M → 伸手。
         不需要大臂可见 —— 近距离 YOLO 经常拿不到肩部关键点。
         """
         if wrist is None:
             return False, "no-W"
         wx, wy, _ = wrist
-        d_w = cls._sample_depth(depth_frame, wx, wy, w, h)
+        d_w = cls._sample_depth(depth_arr, wx, wy, w, h)
         if d_w <= 0:
             return False, "no-d"
         fwd = body_depth - d_w  # 正值 = 手腕比身体更近相机
@@ -228,13 +227,13 @@ class Vision:
 
     @classmethod
     def _detect_gesture_full(cls, keypoints, frame_h: int, body_depth: float,
-                             depth_frame, w: int, h: int) -> tuple[str | None, str]:
+                             depth_arr, w: int, h: int) -> tuple[str | None, str]:
         """返回 (gesture, debug_label)。判据：左/右手腕是否明显比身体靠前。"""
         lw = cls._kp(keypoints, KP_L_WRIST, ARM_CONF)
         rw = cls._kp(keypoints, KP_R_WRIST, ARM_CONF)
 
-        left_ok, l_lbl = cls._wrist_state(lw, body_depth, depth_frame, w, h)
-        right_ok, r_lbl = cls._wrist_state(rw, body_depth, depth_frame, w, h)
+        left_ok, l_lbl = cls._wrist_state(lw, body_depth, depth_arr, w, h)
+        right_ok, r_lbl = cls._wrist_state(rw, body_depth, depth_arr, w, h)
 
         if left_ok and right_ok:
             g = "both"
@@ -247,8 +246,8 @@ class Vision:
         return g, f"body:{body_depth:.2f}m | L:{l_lbl} | R:{r_lbl}"
 
     @staticmethod
-    def _depth_median(depth_frame, box, w: int, h: int, sample_frac: float = 0.15):
-        """取 bbox 中心一小块的有效深度中位数，单点 get_distance 容易踩到 0 或穿透。"""
+    def _depth_median(depth_arr, box, w: int, h: int, sample_frac: float = 0.15):
+        """取 bbox 中心一小块的有效深度中位数，单点容易踩到 0 或穿透。"""
         x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
         cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
         bw, bh = max(1.0, x2 - x1), max(1.0, y2 - y1)
@@ -260,17 +259,16 @@ class Vision:
         py2 = min(h, int(cy + sy))
         if px2 <= px1 or py2 <= py1:
             return None
-        arr = np.asanyarray(depth_frame.get_data())[py1:py2, px1:px2].astype(float) / 1000.0
+        arr = depth_arr[py1:py2, px1:px2].astype(np.float32) * 0.001
         v = arr[(arr > 0.2) & (arr < 8.0)]
         if v.size < 5:
             return None
         return float(np.median(v))
 
     @staticmethod
-    def _check_obstacles(depth_frame, w: int, h: int):
+    def _check_obstacles(depth_arr, w: int, h: int):
         # 只把 ROI 这一条带从 uint16 转成 float32 / 1000，省一大半时间
-        full = np.asanyarray(depth_frame.get_data())  # uint16, full frame
-        roi = full[int(h * ROI_TOP) : int(h * ROI_BOTTOM), :].astype(np.float32) * 0.001
+        roi = depth_arr[int(h * ROI_TOP) : int(h * ROI_BOTTOM), :].astype(np.float32) * 0.001
 
         def min_valid(z):
             v = z[(z > 0.1) & (z < 5.0)]
@@ -283,235 +281,251 @@ class Vision:
         )
 
 
-    # ── 主循环 ──────────────────────────────────────────────────────────────
+    # ── 四段流水线 ───────────────────────────────────────────────────────────
+    # capture 线程：RealSense 抓帧 + align + 复制成 numpy
+    # infer  线程：YOLO-pose 推理（GPU）
+    # 主线程（decide）：候选筛选、目标决策、bridge 下发（控制环跑得快）
+    # draw  线程：plot() + HUD + stream.update + 快照（视觉慢一点没关系）
+    # 各 queue maxsize=1 + 丢旧策略：低延迟，控制环和视觉解耦。
+
+    def _put_latest(self, q: queue.Queue, item) -> None:
+        try:
+            q.get_nowait()  # 丢掉上一帧
+        except queue.Empty:
+            pass
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            pass
+
+    def _capture_loop(self, q_out: queue.Queue) -> None:
+        while not self._stop.is_set():
+            try:
+                frames = self._pipeline.wait_for_frames(timeout_ms=1000)
+            except Exception:
+                continue
+            aligned = self._align.process(frames)
+            color = aligned.get_color_frame()
+            depth = aligned.get_depth_frame()
+            if not color or not depth:
+                continue
+            # 必须 copy —— rs 内部缓冲下一帧会覆盖
+            frame = np.asanyarray(color.get_data()).copy()
+            depth_arr = np.asanyarray(depth.get_data()).copy()  # uint16 mm
+            self._put_latest(q_out, (frame, depth_arr))
+
+    def _infer_loop(self, q_in: queue.Queue, q_out: queue.Queue) -> None:
+        while not self._stop.is_set():
+            try:
+                frame, depth_arr = q_in.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            pose_res = self._model(frame, conf=0.5, verbose=False)[0]
+            self._put_latest(q_out, (frame, depth_arr, pose_res))
+
+    def _draw_loop(self, q_in: queue.Queue) -> None:
+        while not self._stop.is_set():
+            try:
+                payload = q_in.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            self._do_draw(payload)
+
     def run(self) -> None:
-        """阻塞主循环：30 FPS 跑相机 → YOLO-pose → bridge。Ctrl-C 退。"""
+        """四线程流水线：capture | infer | decide(主) | draw。Ctrl-C 退。"""
         self.start()
         assert self._model is not None and self._pipeline is not None
+
+        q_cap = queue.Queue(maxsize=1)
+        q_dec = queue.Queue(maxsize=1)  # infer → decide
+        q_drw = queue.Queue(maxsize=1)  # decide → draw
+        cap_t = threading.Thread(target=self._capture_loop, args=(q_cap,), daemon=True)
+        inf_t = threading.Thread(target=self._infer_loop, args=(q_cap, q_dec), daemon=True)
+        drw_t = threading.Thread(target=self._draw_loop, args=(q_drw,), daemon=True)
+        cap_t.start()
+        inf_t.start()
+        drw_t.start()
+        print("[VISION] 四段流水线启动：capture | infer | decide | draw")
+
         try:
             while not self._stop.is_set():
-                frames = self._pipeline.wait_for_frames()
-                aligned = self._align.process(frames)
-                color = aligned.get_color_frame()
-                depth = aligned.get_depth_frame()
-                if not color or not depth:
+                try:
+                    frame, depth_arr, pose_res = q_dec.get(timeout=0.5)
+                except queue.Empty:
                     continue
-                frame = np.asanyarray(color.get_data())
-                h, w = frame.shape[:2]
-
-                # 障碍
-                dist_l, dist_c, dist_r = self._check_obstacles(depth, w, h)
-                blocked = dist_c < OBSTACLE_DIST
-
-                # 推理：拉高 conf，过掉远处零散误检
-                pose_res = self._model(frame, conf=0.5, verbose=False)[0]
-                annotated = pose_res.plot(boxes=False)  # 用 YOLO 画骨架，自己画框
-
-                gesture = None
-                follow_dist = None
-                follow_err = None
-                boxes = pose_res.boxes
-                kpts_all = pose_res.keypoints
-
-                # 1) 先把所有真人收集起来，算 bbox 中心 patch 的深度中位数
-                candidates = []  # (depth, cx, box, kpts)
-                for i, box in enumerate(boxes):
-                    if int(box.cls) != 0:  # 只看 person
-                        continue
-                    kpts = (
-                        kpts_all[i]
-                        if (kpts_all is not None and i < len(kpts_all))
-                        else None
-                    )
-
-                    if not self._is_real_person(box, kpts, h):
-                        x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
-                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                        cv2.putText(
-                            annotated,
-                            "robot arm",
-                            (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (0, 0, 255),
-                            1,
-                        )
-                        continue
-
-                    d = self._depth_median(depth, box, w, h)
-                    cx = float(box.xywh[0][0])
-                    if d is None:
-                        # 深度无效，灰框标一下就跳过，不作为目标
-                        x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
-                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (160, 160, 160), 1)
-                        cv2.putText(
-                            annotated,
-                            "no-depth",
-                            (x1, max(0, y1 - 5)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (160, 160, 160),
-                            1,
-                        )
-                        continue
-                    if d > self.max_dist:
-                        # 太远不锁，紫色细框标一下当参考
-                        x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
-                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (200, 80, 200), 1)
-                        cv2.putText(
-                            annotated,
-                            f"far {d:.1f}m",
-                            (x1, max(0, y1 - 5)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (200, 80, 200),
-                            1,
-                        )
-                        continue
-                    candidates.append((d, cx, box, kpts))
-
-                # 2) 只锁最近的一个，跟随 + 手势都用它
-                candidates.sort(key=lambda c: c[0])
-                target = candidates[0] if candidates else None
-
-                # 3) 画框：未选中灰细框，选中绿粗框 + TARGET 标签
-                for idx, (d, cx, box, _) in enumerate(candidates):
-                    x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
-                    if idx == 0:
-                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                        cv2.putText(
-                            annotated,
-                            f"TARGET {d:.2f}m",
-                            (x1, max(0, y1 - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7,
-                            (0, 255, 0),
-                            2,
-                        )
-                    else:
-                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (160, 160, 160), 1)
-                        cv2.putText(
-                            annotated,
-                            f"{d:.2f}m",
-                            (x1, max(0, y1 - 5)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (160, 160, 160),
-                            1,
-                        )
-
-                gesture_dbg = ""
-                if target is not None:
-                    d, cx, target_box, kpts = target
-                    if self.gesture and kpts is not None:
-                        gesture, gesture_dbg = self._detect_gesture_full(
-                            kpts, h, d, depth, w, h
-                        )
-                    if self.follow:
-                        follow_dist = d
-                        follow_err = (cx - w / 2) / (w / 2)
-                    # 调试：每只胳膊状态画在 target 框上方
-                    tx1, ty1, _, _ = (int(v) for v in target_box.xyxy[0])
-                    if gesture_dbg:
-                        cv2.putText(
-                            annotated,
-                            gesture_dbg,
-                            (tx1, max(0, ty1 - 30)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (255, 200, 0),
-                            1,
-                        )
-
-                # 下发跟随
-                if self.follow and follow_dist is not None and follow_dist > 0.1:
-                    self.bridge.send_move(follow_dist, follow_err, blocked)
-
-                # 下发手势（有冷却）
-                now = time.time()
-                if (
-                    self.gesture
-                    and gesture
-                    and (now - self._last_action_time) > self.cooldown
-                ):
-                    self._last_action_time = now
-                    action_id, label = ARM_ACTIONS[gesture]
-                    print(f"[VISION] 手势 {gesture} → {label} (id={action_id})")
-                    self.bridge.send_arm(action_id)
-
-                # FPS (EMA)
-                t = time.time()
-                if self._last_frame_time is not None:
-                    dt = t - self._last_frame_time
-                    if dt > 1e-3:
-                        inst = 1.0 / dt
-                        self._fps = inst if self._fps <= 0 else (self._fps * 0.9 + inst * 0.1)
-                self._last_frame_time = t
-
-                # HUD
-                cv2.putText(
-                    annotated,
-                    f"FPS {self._fps:.1f}",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 255),
-                    2,
-                )
-                bar = (0, 0, 255) if blocked else (0, 255, 0)
-                cv2.putText(
-                    annotated,
-                    f"L:{dist_l:.1f} C:{dist_c:.1f} R:{dist_r:.1f}m",
-                    (10, h - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    bar,
-                    2,
-                )
-                if follow_dist:
-                    cv2.putText(
-                        annotated,
-                        f"follow={follow_dist:.2f}m",
-                        (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 255, 0),
-                        2,
-                    )
-                if gesture:
-                    cv2.putText(
-                        annotated,
-                        f"ARM: {gesture.upper()}",
-                        (10, 90),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.9,
-                        (0, 255, 255),
-                        2,
-                    )
-
-                if self.stream is not None:
-                    self.stream.update(annotated)
-
-                # 帧快照：拿来事后人工/我分析为啥识别不准
-                if (
-                    self.snapshot_dir is not None
-                    and (time.time() - self._last_snapshot_time) > self.snapshot_every
-                ):
-                    self._last_snapshot_time = time.time()
-                    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-                    raw_path = self.snapshot_dir / f"{ts}_raw.jpg"
-                    ann_path = self.snapshot_dir / f"{ts}_ann.jpg"
-                    cv2.imwrite(str(raw_path), frame)
-                    cv2.imwrite(str(ann_path), annotated)
-
-                if self.verbose:
-                    cd = max(0.0, self.cooldown - (now - self._last_action_time))
-                    print(
-                        f"[VISION] L{dist_l:.1f} C{dist_c:.1f} R{dist_r:.1f} "
-                        f"blk={int(blocked)} follow={follow_dist} ges={gesture} cd={cd:.1f}",
-                        flush=True,
-                    )
+                self._decide_and_dispatch(frame, depth_arr, pose_res, q_drw)
         except KeyboardInterrupt:
             print("\n[VISION] Ctrl-C 退出")
         finally:
+            self._stop.set()
+            cap_t.join(timeout=2)
+            inf_t.join(timeout=2)
+            drw_t.join(timeout=2)
             self.close()
+
+    def _decide_and_dispatch(self, frame, depth_arr, pose_res, q_drw: queue.Queue) -> None:
+        """快速决策：障碍 + 目标 + 手势 + bridge 下发；画图丢给 draw 线程。"""
+        h, w = frame.shape[:2]
+        dist_l, dist_c, dist_r = self._check_obstacles(depth_arr, w, h)
+        blocked = dist_c < OBSTACLE_DIST
+
+        gesture = None
+        follow_dist = None
+        follow_err = None
+        boxes = pose_res.boxes
+        kpts_all = pose_res.keypoints
+
+        box_marks = []  # (kind, x1, y1, x2, y2, label)，draw 线程根据 kind 上色
+        candidates = []  # (d, cx, box_xy, kpts)
+
+        for i, box in enumerate(boxes):
+            if int(box.cls) != 0:
+                continue
+            kpts = (
+                kpts_all[i] if (kpts_all is not None and i < len(kpts_all)) else None
+            )
+            x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
+
+            if not self._is_real_person(box, kpts, h):
+                box_marks.append(("robot_arm", x1, y1, x2, y2, "robot arm"))
+                continue
+
+            d = self._depth_median(depth_arr, box, w, h)
+            cx = float(box.xywh[0][0])
+            if d is None:
+                box_marks.append(("no_depth", x1, y1, x2, y2, "no-depth"))
+                continue
+            if d > self.max_dist:
+                box_marks.append(("far", x1, y1, x2, y2, f"far {d:.1f}m"))
+                continue
+            candidates.append((d, cx, (x1, y1, x2, y2), kpts))
+
+        candidates.sort(key=lambda c: c[0])
+        target = candidates[0] if candidates else None
+
+        for idx, (d, _cx, xy, _kpts) in enumerate(candidates):
+            x1, y1, x2, y2 = xy
+            if idx == 0:
+                box_marks.append(("target", x1, y1, x2, y2, f"TARGET {d:.2f}m"))
+            else:
+                box_marks.append(("other", x1, y1, x2, y2, f"{d:.2f}m"))
+
+        gesture_dbg = ""
+        target_xy_for_dbg = None
+        if target is not None:
+            d, cx, txy, kpts = target
+            if self.gesture and kpts is not None:
+                gesture, gesture_dbg = self._detect_gesture_full(
+                    kpts, h, d, depth_arr, w, h
+                )
+            if self.follow:
+                follow_dist = d
+                follow_err = (cx - w / 2) / (w / 2)
+            target_xy_for_dbg = (txy[0], txy[1])
+
+        # 控制下发（快）
+        if self.follow and follow_dist is not None and follow_dist > 0.1:
+            self.bridge.send_move(follow_dist, follow_err, blocked)
+
+        now = time.time()
+        if (
+            self.gesture
+            and gesture
+            and (now - self._last_action_time) > self.cooldown
+        ):
+            self._last_action_time = now
+            action_id, label = ARM_ACTIONS[gesture]
+            print(f"[VISION] 手势 {gesture} → {label} (id={action_id})")
+            self.bridge.send_arm(action_id)
+
+        # 控制环 FPS（用户在 HUD 上看到的就是这个，反映 bridge 下发速率）
+        if self._last_frame_time is not None:
+            dt = now - self._last_frame_time
+            if dt > 1e-3:
+                inst = 1.0 / dt
+                self._fps = inst if self._fps <= 0 else (self._fps * 0.9 + inst * 0.1)
+        self._last_frame_time = now
+
+        # 决定要不要让 draw 线程存快照
+        snapshot_now = (
+            self.snapshot_dir is not None
+            and (now - self._last_snapshot_time) > self.snapshot_every
+        )
+        if snapshot_now:
+            self._last_snapshot_time = now
+
+        # 把所有渲染需要的状态打包扔给 draw 线程（丢旧）
+        self._put_latest(
+            q_drw,
+            {
+                "frame": frame,
+                "pose_res": pose_res,
+                "box_marks": box_marks,
+                "target_xy_for_dbg": target_xy_for_dbg,
+                "gesture": gesture,
+                "gesture_dbg": gesture_dbg,
+                "blocked": blocked,
+                "dist_l": dist_l,
+                "dist_c": dist_c,
+                "dist_r": dist_r,
+                "follow_dist": follow_dist,
+                "fps": self._fps,
+                "snapshot_now": snapshot_now,
+                "h": h,
+                "w": w,
+            },
+        )
+
+        if self.verbose:
+            cd = max(0.0, self.cooldown - (now - self._last_action_time))
+            print(
+                f"[VISION] L{dist_l:.1f} C{dist_c:.1f} R{dist_r:.1f} "
+                f"blk={int(blocked)} follow={follow_dist} ges={gesture} cd={cd:.1f}",
+                flush=True,
+            )
+
+    # 颜色/粗细/字号 表，给 draw 线程用
+    _BOX_STYLE = {
+        "robot_arm": ((0, 0, 255), 2, 0.5, 1),
+        "no_depth":  ((160, 160, 160), 1, 0.5, 1),
+        "far":       ((200, 80, 200), 1, 0.5, 1),
+        "other":     ((160, 160, 160), 1, 0.5, 1),
+        "target":    ((0, 255, 0), 3, 0.7, 2),
+    }
+
+    def _do_draw(self, p: dict) -> None:
+        """画图 + 推流 + 快照。在 draw 线程里跑，慢了不影响控制环。"""
+        annotated = p["pose_res"].plot(boxes=False)
+        h, w = p["h"], p["w"]
+
+        for kind, x1, y1, x2, y2, label in p["box_marks"]:
+            col, thk, fs, ft = self._BOX_STYLE.get(kind, ((255, 255, 255), 1, 0.5, 1))
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), col, thk)
+            cv2.putText(annotated, label, (x1, max(0, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, fs, col, ft)
+
+        if p["target_xy_for_dbg"] and p["gesture_dbg"]:
+            tx1, ty1 = p["target_xy_for_dbg"]
+            cv2.putText(annotated, p["gesture_dbg"], (tx1, max(0, ty1 - 30)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
+
+        cv2.putText(annotated, f"FPS {p['fps']:.1f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        bar = (0, 0, 255) if p["blocked"] else (0, 255, 0)
+        cv2.putText(annotated,
+                    f"L:{p['dist_l']:.1f} C:{p['dist_c']:.1f} R:{p['dist_r']:.1f}m",
+                    (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bar, 2)
+        if p["follow_dist"]:
+            cv2.putText(annotated, f"follow={p['follow_dist']:.2f}m", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        if p["gesture"]:
+            cv2.putText(annotated, f"ARM: {p['gesture'].upper()}", (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+
+        if self.stream is not None:
+            self.stream.update(annotated)
+
+        if p["snapshot_now"] and self.snapshot_dir is not None:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            cv2.imwrite(str(self.snapshot_dir / f"{ts}_raw.jpg"), p["frame"])
+            cv2.imwrite(str(self.snapshot_dir / f"{ts}_ann.jpg"), annotated)
