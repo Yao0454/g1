@@ -62,13 +62,13 @@ class G1App extends StatelessWidget {
         ),
         inputDecorationTheme: InputDecorationTheme(
           filled: true,
-          forder: OutlineInputBorder(
+          fillColor: const Color(0xFF1A1A2E),
+          border: OutlineInputBorder(
             borderRadius: BorderRadius.circular(8),
-      illColor: const Color(0xFF1A1A2E),
-          b      borderSide: const BorderSide(color: Color(0xFF2A2A4A)),
+            borderSide: const BorderSide(color: Color(0xFF2A2A4A)),
           ),
           enabledBorder: OutlineInputBorder(
-  w          borderRadius: BorderRadius.circular(8),
+            borderRadius: BorderRadius.circular(8),
             borderSide: const BorderSide(color: Color(0xFF2A2A4A)),
           ),
           focusedBorder: OutlineInputBorder(

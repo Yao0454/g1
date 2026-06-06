@@ -11,7 +11,13 @@ core/stream.py — 一个共享的 MJPEG HTTP 流，多个组件可往里塞最�
 from __future__ import annotations
 
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+from http.server import HTTPServer as _HTTPServer
+
+class HTTPServer(ThreadingMixIn, _HTTPServer):
+    """每个连接独立线程，允许多个客户端同时接流（浏览器 + Flutter 同时连）。"""
+    daemon_threads = True
 
 import cv2
 

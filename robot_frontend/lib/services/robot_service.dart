@@ -24,7 +24,7 @@ class RobotService extends ChangeNotifier {
   static const int _maxLogs = 150;
 
   // 连接配置（从 SharedPreferences 加载）
-  String host = '192.168.123.164';
+  String host = '192.168.31.43';
   int wsPort = 8765;
   int mjpegPort = 6769;
 
