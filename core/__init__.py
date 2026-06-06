@@ -8,6 +8,7 @@
     ...
 """
 
+from .api import ApiServer
 from .bridge import MSG_ARM, MSG_MOVE, MSG_TTS, Bridge
 from .chat import Chat
 from .stream import MjpegStream
@@ -15,6 +16,7 @@ from .vision import Vision
 from .voice import Voice
 
 __all__ = [
+    "ApiServer",
     "Bridge",
     "Vision",
     "Voice",

@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 from core import Bridge, Chat, MjpegStream, Vision, Voice
+from core.api import ApiServer
 
 
 def main() -> None:
@@ -46,6 +47,8 @@ def main() -> None:
     p.add_argument("--log-frames", action="store_true",
                    help="把每帧推理结果存到 data/snapshots/（事后排查识别问题）")
     p.add_argument("--log-frames-every", type=float, default=2.0, help="快照间隔(s)")
+    p.add_argument("--api-port", type=int, default=8765,
+                   help="Flutter WebSocket API 端口（0 关）")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
 
@@ -54,6 +57,38 @@ def main() -> None:
 
     bridge = Bridge(host=args.bridge_host, port=args.bridge_port, verbose=args.verbose)
     print(f"[G1] bridge → {args.bridge_host}:{args.bridge_port} (一个 UDP 端口走三种消息)")
+
+    # ── Flutter API 服务端 ────────────────────────────────────────────────────
+    api: ApiServer | None = None
+    if args.api_port > 0:
+        api = ApiServer(bridge, port=args.api_port)
+        api.follow = not args.no_follow and not args.no_vision
+        api.gesture = not args.no_gesture and not args.no_vision
+        api.voice = not args.no_voice
+
+    # toggle 回调（vision/voice 对象在下面创建，用 list 做可变引用）
+    _vision_ref: list = [None]
+    _voice_ref: list = [None]
+
+    def _on_toggle(feat: str, enabled: bool) -> None:
+        vis = _vision_ref[0]
+        voc = _voice_ref[0]
+        if feat == "follow" and vis is not None:
+            vis.follow = enabled
+            if api: api.push_log("info", f"跟随 {'开启' if enabled else '关闭'}")
+        elif feat == "gesture" and vis is not None:
+            vis.gesture = enabled
+            if api: api.push_log("info", f"手势 {'开启' if enabled else '关闭'}")
+        elif feat == "voice" and voc is not None:
+            if enabled:
+                voc.resume()
+            else:
+                voc.pause()
+            if api: api.push_log("info", f"语音 {'开启' if enabled else '关闭'}")
+
+    if api:
+        api.on_toggle = _on_toggle
+        api.start()
 
     voice = None
     if not args.no_voice:
@@ -65,6 +100,10 @@ def main() -> None:
                       listen_seconds=args.listen_seconds,
                       local_tts=args.local_tts,
                       verbose=args.verbose)
+        if api:
+            voice.on_asr = api.push_asr
+            voice.on_reply = api.push_llm
+        _voice_ref[0] = voice
         voice.start()  # 后台线程
 
     # 视觉跑主线程（相机/YOLO 比较重，留主线程）
@@ -81,6 +120,7 @@ def main() -> None:
                         snapshot_dir=snapshot_dir,
                         snapshot_every=args.log_frames_every,
                         verbose=args.verbose)
+        _vision_ref[0] = vision
         try:
             vision.run()   # 阻塞，Ctrl-C 跳出
         finally:

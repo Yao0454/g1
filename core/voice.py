@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Callable, Optional
 
 import numpy as np
 import sherpa_onnx
@@ -413,12 +414,17 @@ class Voice:
         self.verbose = verbose
 
         self._stop = threading.Event()
+        self._paused = threading.Event()    # 前端关闭语音时暂停循环
         self._thread: threading.Thread | None = None
         self._asr: _ASR | None = None
         self._wake: _Wake | None = None
         self._vad = None
         self._mic: MicStream | None = None
         self._local_tts: _LocalTTS | None = None
+
+        # 外部回调：前端调试面板用
+        self.on_asr: Callable[[str], None] | None = None    # ASR 识别完回调
+        self.on_reply: Callable[[str], None] | None = None  # LLM 回复完回调
 
     # ── 启动/停止 ───────────────────────────────────────────────────────────
     def _load(self) -> None:
@@ -452,6 +458,14 @@ class Voice:
             self._thread.join(timeout=5.0)
         if self._mic:
             self._mic.close()
+
+    def pause(self) -> None:
+        """暂停唤醒-对话循环（前端关闭语音时调）。"""
+        self._paused.set()
+
+    def resume(self) -> None:
+        """恢复唤醒-对话循环。"""
+        self._paused.clear()
 
     # ── 高级接口 ────────────────────────────────────────────────────────────
     def say(self, text: str) -> float:
@@ -524,10 +538,15 @@ class Voice:
         print(f"=== Voice 起飞，唤醒词 {self.wake_words}；voice.stop() 退出 ===")
         try:
             while not self._stop.is_set():
+                if self._paused.is_set():
+                    time.sleep(0.5)
+                    continue
                 print(f"\n[KWS] 等待唤醒词 …", flush=True)
                 hit = self._wake.wait(self._mic, self._stop, debug=self.verbose)
                 if hit is None:
                     break
+                if self._paused.is_set():
+                    continue
                 print(f"[KWS] 唤醒：{hit}")
                 beep()
                 self._mic.drain()
@@ -543,6 +562,8 @@ class Voice:
                 t0 = time.time()
                 text = self._asr.transcribe(_prep_for_asr(samples))
                 print(f"[识别] {text!r}   (ASR {time.time() - t0:.2f}s)")
+                if self.on_asr and text:
+                    self.on_asr(text)
                 if not text:
                     continue
                 if self.chat is None:
@@ -550,6 +571,8 @@ class Voice:
                 t0 = time.time()
                 reply = self.chat.reply(text)
                 print(f"[回复] {reply}   (LLM {time.time() - t0:.2f}s)")
+                if self.on_reply and reply:
+                    self.on_reply(reply)
                 self._settle(self.say(reply))
         except Exception as e:
             print(f"[VOICE] 循环异常退出：{e}", file=sys.stderr)
