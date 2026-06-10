@@ -27,6 +27,7 @@ from pathlib import Path
 from core import Bridge, Chat, MjpegStream, Vision, Voice
 from core.api import ApiServer
 
+# main function
 
 def main() -> None:
     p = argparse.ArgumentParser(description="G1 跟随 + 手势 + 语音 一起跑")
