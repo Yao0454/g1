@@ -4,6 +4,7 @@
 from typing import Any, Callable, TypeVar
 
 from core.bridge import Bridge
+from core.skills import load_skill
 
 ToolFn = Callable[
     ...,
@@ -48,6 +49,37 @@ class ToolRegistry:
             return fn
 
         return deco
+
+    @property
+    def schemas(self) -> list[dict[str, Any]]:
+        """
+        所有工具的 schema，喂给 ollama.chat(tools=...)
+
+        Returns:
+            list[dict[str, Any]] => 所有工具的 schema
+        """
+        return [schema for schema, _ in self.registered_tools.values()]
+
+    def call(self, name: str, arguments: dict[str, Any]) -> Any:
+        """
+        将 tool_calls 里的 name 分发执行
+
+        Args:
+            name: str                   => tool name
+            arguments: dict[str, Any]   => 调用 tools 所需要的参数
+
+        Returns:
+            Any => tools 调用后的结果
+        """
+
+        if name not in self.registered_tools:
+            return f"[Error]: unknown tool {name!r}"
+        _, fn = self.registered_tools[name]
+
+        try:
+            return fn(**arguments)
+        except Exception as e:
+            return f"[Error]: {e}"
 
 
 bridge = Bridge()
@@ -94,3 +126,26 @@ def shake_hand() -> str:
         return "Succeed!"
     except Exception as e:
         return f"{e}"
+
+
+@tools.register(
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": "加载某个技能的详细操作说明",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "技能名称",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    }
+)
+def load_skill_tool(name: str) -> str:
+    return load_skill(name)

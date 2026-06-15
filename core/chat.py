@@ -18,6 +18,11 @@ os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
 
 import ollama  # noqa: E402
 
+from core.skills import list_skills_detail
+from core.tools import tools
+
+MAX_ROUNDS: int = 5
+
 
 class Chat:
     SYSTEM_PROMPT = "你是一个非常友善的宇树 G1 机器人，你的概括能力很强，你每次回答都是一句话，不超过20个字"
@@ -36,7 +41,6 @@ class Chat:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.history: list[dict] = self._load()
 
-    # ── 历史持久化 ───────────────────────────────────────────────────────────
     def _path(self) -> Path:
         return self.data_dir / f"{self.session_id}.json"
 
@@ -63,13 +67,16 @@ class Chat:
         self.history = []
         self._save()
 
-    # ── 调用 ────────────────────────────────────────────────────────────────
     def _system(self, extra: str = "") -> str:
         s = self.SYSTEM_PROMPT
         if self.user_name:
             s += f"\n\n## 当前用户\n你正在服务的用户是：{self.user_name}"
         if extra:
             s += f"\n\n## 额外上下文\n{extra}"
+        skills: list[tuple[str, str]] = list_skills_detail()
+        if skills:
+            s += "\n\n## 可用技能（需要时调用 load_skill 加载详细说明）\n"
+            s += "\n".join(f"- {name}: {desc}" for name, desc in skills)
         return s
 
     def reply(self, user_text: str, extra_context: str = "") -> str:
@@ -77,9 +84,28 @@ class Chat:
         messages = [{"role": "system", "content": self._system(extra_context)}]
         messages.extend(self.history)
         messages.append({"role": "user", "content": user_text})
-        resp = ollama.chat(model=self.model, messages=messages, think=False)
-        reply = resp["message"]["content"]
+
+        reply_text = ""  # 先初始化为空
+        for _ in range(MAX_ROUNDS):  # 循环多轮，直到 no tool_call 为止
+            resp = ollama.chat(
+                model=self.model,
+                messages=messages,
+                tools=tools.schemas,
+                think=False,
+            )  # 喂给 llm
+            msg = resp["message"]
+            messages.append(dict(msg))
+            tool_calls = msg.get("tool_calls")  # 获取 tool_calls
+            if not tool_calls:
+                reply_text = msg["content"]
+                break
+            for tc in tool_calls:  # 执行 tool_calls
+                fn = tc["function"]
+                result = tools.call(fn["name"], fn["arguments"])
+                messages.append(
+                    {"role": "tool", "name": fn["name"], "content": str(result)}
+                )
         self.history.append({"role": "user", "content": user_text})
-        self.history.append({"role": "assistant", "content": reply})
+        self.history.append({"role": "assistant", "content": reply_text})
         self._save()
-        return reply
+        return reply_text
