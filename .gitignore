@@ -13,3 +13,5 @@ data/session/
 .vscode/
 .idea/
 *.swp
+
+.claude/
